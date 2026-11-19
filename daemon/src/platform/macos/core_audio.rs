@@ -16,13 +16,15 @@ use core_foundation::number::CFNumber;
 use core_foundation::string::{CFString, CFStringRef};
 use coreaudio_sys::{
     AudioDeviceID, AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize, AudioObjectID,
-    AudioObjectPropertyAddress, AudioObjectSetPropertyData, AudioValueTranslation, KERN_SUCCESS,
-    kAudioAggregateDevicePropertyFullSubDeviceList, kAudioDevicePropertyDeviceUID,
-    kAudioDevicePropertyPreferredChannelsForStereo, kAudioHardwareNoError,
-    kAudioHardwarePropertyDevices, kAudioHardwarePropertyPlugInForBundleID,
-    kAudioObjectPropertyElementMaster, kAudioObjectPropertyScopeGlobal,
-    kAudioObjectPropertyScopeInput, kAudioObjectPropertyScopeOutput, kAudioObjectSystemObject,
-    kAudioObjectUnknown, kAudioPlugInCreateAggregateDevice, kAudioPlugInDestroyAggregateDevice,
+    AudioObjectPropertyAddress, AudioObjectPropertySelector, AudioObjectSetPropertyData,
+    AudioValueTranslation, KERN_SUCCESS, kAudioAggregateDevicePropertyFullSubDeviceList,
+    kAudioDevicePropertyDeviceUID, kAudioDevicePropertyModelUID,
+    kAudioDevicePropertyPreferredChannelsForStereo, kAudioDevicePropertyTransportType,
+    kAudioDeviceTransportTypeUSB, kAudioHardwareNoError, kAudioHardwarePropertyDevices,
+    kAudioHardwarePropertyPlugInForBundleID, kAudioObjectPropertyElementMaster,
+    kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyScopeInput,
+    kAudioObjectPropertyScopeOutput, kAudioObjectSystemObject, kAudioObjectUnknown,
+    kAudioPlugInCreateAggregateDevice, kAudioPlugInDestroyAggregateDevice,
 };
 use goxlr_usb::{PID_GOXLR_FULL, PID_GOXLR_MINI, VID_GOXLR};
 use io_kit_sys::types::io_iterator_t;
@@ -297,8 +299,22 @@ pub fn set_active_channels(
 }
 
 pub fn find_all_existing_aggregates() -> Result<Vec<AudioDeviceID>> {
-    // Ok, we need to ask CoreAudio for a list of devices via kAudioHardwarePropertyDevices, then
-    // iterate them all, fetch their UIDs, then compare it against ours.
+    // Ok, we need to ask CoreAudio for a list of devices, then iterate them all, fetch their
+    // UIDs, then compare it against ours.
+    let mut device_list = Vec::new();
+    for device in get_all_device_ids()? {
+        if let Ok(uid) = get_uid_for_id(device)
+            && (uid.starts_with(AGGREGATE_PREFIX) || uid.starts_with(LEGACY_PREFIX))
+        {
+            device_list.push(device);
+        }
+    }
+
+    Ok(device_list)
+}
+
+/// Returns the IDs of all devices currently known to CoreAudio
+fn get_all_device_ids() -> Result<Vec<AudioDeviceID>> {
     let properties = AudioObjectPropertyAddress {
         mSelector: kAudioHardwarePropertyDevices,
         mScope: kAudioObjectPropertyScopeGlobal,
@@ -342,24 +358,30 @@ pub fn find_all_existing_aggregates() -> Result<Vec<AudioDeviceID>> {
         bail!("CoreAudio Error: {}", status);
     }
 
-    let mut device_list = Vec::new();
-    for device in device_ids {
-        if let Ok(uid) = get_uid_for_id(device)
-            && (uid.starts_with(AGGREGATE_PREFIX) || uid.starts_with(LEGACY_PREFIX))
-        {
-            device_list.push(device);
-        }
-    }
-
-    Ok(device_list)
+    Ok(device_ids)
 }
 
 /*
-    This function iterates over all the present CoreAudio devices, and attempts to match
+    Finds all attached GoXLR devices, and returns their CoreAudio UID and display name.
+
+    Historically USB Audio devices were published in the IORegistry as IOAudioEngine services
+    which carried the device's VID/PID. Since macOS 26 USB Audio is handled by usbaudiod and
+    no IOAudioEngine services are published any more, so if that lookup comes back empty we
+    fall back to matching the VID/PID via CoreAudio itself.
+*/
+pub fn get_goxlr_devices() -> Result<Vec<CoreAudioDevice>> {
+    match get_goxlr_devices_from_io_registry() {
+        Ok(devices) if !devices.is_empty() => Ok(devices),
+        _ => get_goxlr_devices_from_core_audio(),
+    }
+}
+
+/*
+    This function iterates over all the IOAudioEngine services, and attempts to match
     their VID/PID to a physical GoXLR device. If found, returns the device's UID and it's
     display name according to MacOS.
 */
-pub fn get_goxlr_devices() -> Result<Vec<CoreAudioDevice>> {
+fn get_goxlr_devices_from_io_registry() -> Result<Vec<CoreAudioDevice>> {
     let mut devices: Vec<CoreAudioDevice> = Vec::new();
 
     let mut iterator = mem::MaybeUninit::<io_iterator_t>::uninit();
@@ -428,4 +450,155 @@ pub fn get_goxlr_devices() -> Result<Vec<CoreAudioDevice>> {
     }
 
     Ok(devices)
+}
+
+/*
+    Matches GoXLR devices using CoreAudio directly. For USB Audio devices, the ModelUID has
+    the form '<Product Name>:<VID>:<PID>' with the IDs in hex (for example 'GoXLR:1220:8FE0'),
+    so we can still confirm the VID/PID of the device rather than relying on its name.
+*/
+fn get_goxlr_devices_from_core_audio() -> Result<Vec<CoreAudioDevice>> {
+    let mut devices: Vec<CoreAudioDevice> = Vec::new();
+
+    for device in get_all_device_ids()? {
+        // Only physical USB devices carry their VID/PID in the ModelUID..
+        let transport = get_u32_property(device, kAudioDevicePropertyTransportType);
+        if transport.ok() != Some(kAudioDeviceTransportTypeUSB) {
+            continue;
+        }
+
+        let Ok(model_uid) = get_string_property(device, kAudioDevicePropertyModelUID) else {
+            continue;
+        };
+        let Some((vid, pid)) = parse_usb_model_uid(&model_uid) else {
+            continue;
+        };
+
+        // Check whether this is a GoXLR..
+        if vid != VID_GOXLR || (pid != PID_GOXLR_FULL && pid != PID_GOXLR_MINI) {
+            continue;
+        }
+
+        let Ok(uid) = get_string_property(device, kAudioDevicePropertyDeviceUID) else {
+            continue;
+        };
+        let Ok(display_name) = get_string_property(device, kAudioObjectPropertyName) else {
+            continue;
+        };
+
+        devices.push(CoreAudioDevice { display_name, uid });
+    }
+
+    Ok(devices)
+}
+
+/// Extracts the USB VID and PID from a CoreAudio ModelUID ('<Product Name>:<VID>:<PID>')
+fn parse_usb_model_uid(model_uid: &str) -> Option<(u16, u16)> {
+    // The product name may itself contain a ':', so work from the end..
+    let mut parts = model_uid.rsplitn(3, ':');
+    let pid = u16::from_str_radix(parts.next()?, 16).ok()?;
+    let vid = u16::from_str_radix(parts.next()?, 16).ok()?;
+
+    // Make sure there was a product name before the IDs..
+    parts.next()?;
+    Some((vid, pid))
+}
+
+fn get_string_property(id: AudioObjectID, selector: AudioObjectPropertySelector) -> Result<String> {
+    let properties = AudioObjectPropertyAddress {
+        mSelector: selector,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMaster,
+    };
+
+    let mut value: CFStringRef = null();
+    let mut size = mem::size_of::<CFStringRef>() as UInt32;
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            id,
+            &properties,
+            0,
+            null(),
+            &mut size,
+            &mut value as *mut _ as *mut c_void,
+        )
+    };
+
+    if status != kAudioHardwareNoError as i32 || value.is_null() {
+        bail!(
+            "Error Fetching Property {} for {}: {}",
+            selector,
+            id,
+            status
+        );
+    }
+
+    // The caller is responsible for releasing the returned CFString..
+    Ok(unsafe { CFString::wrap_under_create_rule(value) }.to_string())
+}
+
+fn get_u32_property(id: AudioObjectID, selector: AudioObjectPropertySelector) -> Result<UInt32> {
+    let properties = AudioObjectPropertyAddress {
+        mSelector: selector,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMaster,
+    };
+
+    let mut value: UInt32 = 0;
+    let mut size = mem::size_of::<UInt32>() as UInt32;
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            id,
+            &properties,
+            0,
+            null(),
+            &mut size,
+            &mut value as *mut _ as *mut c_void,
+        )
+    };
+
+    if status != kAudioHardwareNoError as i32 {
+        bail!(
+            "Error Fetching Property {} for {}: {}",
+            selector,
+            id,
+            status
+        );
+    }
+
+    Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_usb_model_uid;
+
+    #[test]
+    fn parses_usb_model_uid() {
+        assert_eq!(
+            parse_usb_model_uid("GoXLR:1220:8FE0"),
+            Some((0x1220, 0x8fe0))
+        );
+        assert_eq!(
+            parse_usb_model_uid("GoXLRMini:1220:8FE4"),
+            Some((0x1220, 0x8fe4))
+        );
+        assert_eq!(
+            parse_usb_model_uid("Elgato HD60 X:0FD9:008A"),
+            Some((0x0fd9, 0x008a))
+        );
+        assert_eq!(
+            parse_usb_model_uid("Name:With:Colons:1220:8FE0"),
+            Some((0x1220, 0x8fe0))
+        );
+    }
+
+    #[test]
+    fn rejects_other_model_uids() {
+        assert_eq!(parse_usb_model_uid("Digital Mic"), None);
+        assert_eq!(parse_usb_model_uid("Speaker"), None);
+        assert_eq!(parse_usb_model_uid("1220:8FE0"), None);
+        assert_eq!(parse_usb_model_uid("GoXLR:12345:8FE0"), None);
+        assert_eq!(parse_usb_model_uid("GoXLR:1220:XYZ"), None);
+    }
 }
